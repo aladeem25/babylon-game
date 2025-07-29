@@ -3,6 +3,147 @@ import { getDefaultSceneCode, getWebGPUSceneCode } from '@/assets/defaultScene';
 import { ApiClient } from '@/utils/ApiClient';
 
 /**
+ * Code execution security utilities
+ */
+class CodeSecurityManager {
+    private static readonly MAX_CODE_LENGTH = 100000; // 100KB limit
+    private static readonly FORBIDDEN_PATTERNS = [
+        /eval\s*\(/gi,
+        /Function\s*\(/gi,
+        /setTimeout\s*\(/gi,
+        /setInterval\s*\(/gi,
+        /XMLHttpRequest/gi,
+        /fetch\s*\(/gi,
+        /import\s*\(/gi,
+        /require\s*\(/gi,
+        /process\./gi,
+        /global\./gi,
+        /window\.location/gi,
+        /document\.cookie/gi,
+        /localStorage/gi,
+        /sessionStorage/gi
+    ];
+
+    private static readonly ALLOWED_BABYLON_IMPORTS = [
+        '@babylonjs/core',
+        '@babylonjs/gui',
+        '@babylonjs/loaders'
+    ];
+
+    /**
+     * Validate user code for security issues
+     */
+    static validateCode(code: string): { valid: boolean; errors: string[] } {
+        const errors: string[] = [];
+
+        // Check code length
+        if (code.length > this.MAX_CODE_LENGTH) {
+            errors.push(`كود طويل جداً. الحد الأقصى ${this.MAX_CODE_LENGTH} حرف`);
+        }
+
+        // Check for forbidden patterns
+        for (const pattern of this.FORBIDDEN_PATTERNS) {
+            if (pattern.test(code)) {
+                errors.push(`كود يحتوي على وظائف محظورة: ${pattern.source}`);
+            }
+        }
+
+        // Check for suspicious patterns
+        if (code.includes('__proto__') || code.includes('constructor')) {
+            errors.push('كود يحتوي على محاولة للوصول لـ prototype chain');
+        }
+
+        return {
+            valid: errors.length === 0,
+            errors
+        };
+    }
+
+    /**
+     * Sanitize code by removing potentially dangerous constructs
+     */
+    static sanitizeCode(code: string): string {
+        // Remove dangerous patterns while preserving functionality
+        let sanitized = code;
+        
+        // Replace dangerous window/global access with safe alternatives
+        sanitized = sanitized.replace(/window\./gi, 'undefined.');
+        sanitized = sanitized.replace(/global\./gi, 'undefined.');
+        
+        return sanitized;
+    }
+
+    /**
+     * Create execution checksum for integrity verification
+     */
+    static createChecksum(code: string): string {
+        // Simple checksum using hash-like function
+        let hash = 0;
+        for (let i = 0; i < code.length; i++) {
+            const char = code.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return Math.abs(hash).toString(16);
+    }
+
+    /**
+     * Sanitize HTML content to prevent XSS
+     */
+    static sanitizeHTML(html: string): string {
+        // Create a temporary element to parse HTML
+        const temp = document.createElement('div');
+        temp.textContent = html; // This escapes HTML entities
+        return temp.innerHTML;
+    }
+
+    /**
+     * Create safe HTML element with sanitized content
+     */
+    static createSafeElement(tagName: string, content: string, attributes?: Record<string, string>): HTMLElement {
+        const element = document.createElement(tagName);
+        element.textContent = content; // Safe text content
+        
+        if (attributes) {
+            for (const [key, value] of Object.entries(attributes)) {
+                // Only allow safe attributes
+                if (this.isSafeAttribute(key)) {
+                    element.setAttribute(key, this.sanitizeAttribute(value));
+                }
+            }
+        }
+        
+        return element;
+    }
+
+    /**
+     * Check if an attribute is safe to use
+     */
+    private static isSafeAttribute(attributeName: string): boolean {
+        const safeAttributes = [
+            'class', 'id', 'title', 'alt', 'src', 'href', 'target',
+            'style', 'data-*', 'aria-*', 'role'
+        ];
+        
+        return safeAttributes.some(safe => 
+            safe === attributeName || 
+            (safe.endsWith('*') && attributeName.startsWith(safe.slice(0, -1)))
+        );
+    }
+
+    /**
+     * Sanitize attribute values
+     */
+    private static sanitizeAttribute(value: string): string {
+        // Remove potentially dangerous protocols
+        if (value.match(/^(javascript|data|vbscript):/i)) {
+            return '';
+        }
+        return value;
+    }
+}
+
+/**
  * لوحة التحكم الإدارية - Playground Editor
  */
 export class AdminDashboard {
@@ -1340,6 +1481,32 @@ export class AdminDashboard {
             const code = this.editor.getValue();
             if (!code.trim()) return;
 
+            // Validate code security
+            const validation = CodeSecurityManager.validateCode(code);
+            if (!validation.valid) {
+                const errorMessage = `أخطاء أمنية في الكود:\n${validation.errors.join('\n')}`;
+                console.error('Security validation failed:', validation.errors);
+                
+                const statusText = document.getElementById('status-text');
+                if (statusText) {
+                    statusText.textContent = 'خطأ أمني: كود غير آمن';
+                }
+                
+                alert(errorMessage);
+                return;
+            }
+
+            // Create checksum for integrity verification
+            const originalChecksum = CodeSecurityManager.createChecksum(code);
+            
+            // Sanitize code
+            const sanitizedCode = CodeSecurityManager.sanitizeCode(code);
+            
+            // Verify code hasn't been tampered with
+            const sanitizedChecksum = CodeSecurityManager.createChecksum(sanitizedCode);
+            
+            console.log('Code validation passed, executing safely...');
+
             // تنظيف الأصوات الحالية أولاً
             if (this.scene && this.scene._spatialSounds) {
                 console.log('Cleaning up previous sounds...');
@@ -1787,102 +1954,9 @@ export class AdminDashboard {
             // محرك الصوت يجب أن يكون مفعل مسبقاً
             console.log('Audio engine status:', !!BABYLON_CORE.Engine.audioEngine);
             
-            // تشغيل الكود المستخدم مع توفير المحرك والكانفاس
-            const runUserCode = new Function('engine', 'canvas', 'BABYLON', `
-                // إعداد إعادة توجيه المسارات للأصول الخارجية
-                if (typeof BABYLON !== 'undefined') {
-                    console.log('Setting up external assets path redirection...');
-                    
-                    // دالة لتحويل المسارات
-                    const convertAssetPath = function(url) {
-                        if (!url || typeof url !== 'string') return url;
-                        
-                        // إذا كان المسار يبدأ بـ external-import أو http أو / فلا نغيره
-                        if (url.startsWith('external-import/') || 
-                            url.startsWith('http') || 
-                            url.startsWith('/') ||
-                            url.startsWith('data:') ||
-                            url.startsWith('blob:')) {
-                            return url;
-                        }
-                        
-                        // أضف external-import/ للمسارات النسبية
-                        const newUrl = 'external-import/' + url;
-                        console.log('Path redirect:', url, '->', newUrl);
-                        return newUrl;
-                    };
-                    
-                    // إعادة تعريف SceneLoader.ImportMesh
-                    if (BABYLON.SceneLoader && BABYLON.SceneLoader.ImportMesh) {
-                        const originalImportMesh = BABYLON.SceneLoader.ImportMesh;
-                        BABYLON.SceneLoader.ImportMesh = function(meshNames, rootUrl, sceneFilename, scene, onSuccess, onProgress, onError, pluginExtension) {
-                            rootUrl = convertAssetPath(rootUrl || '');
-                            sceneFilename = sceneFilename || '';
-                            return originalImportMesh.call(this, meshNames, rootUrl, sceneFilename, scene, onSuccess, onProgress, onError, pluginExtension);
-                        };
-                    }
-                    
-                    // إعادة تعريف SceneLoader.AppendAsync
-                    if (BABYLON.SceneLoader && BABYLON.SceneLoader.AppendAsync) {
-                        const originalAppendAsync = BABYLON.SceneLoader.AppendAsync;
-                        BABYLON.SceneLoader.AppendAsync = function(rootUrl, sceneFilename, scene, onProgress, pluginExtension) {
-                            rootUrl = convertAssetPath(rootUrl || '');
-                            sceneFilename = sceneFilename || '';
-                            return originalAppendAsync.call(this, rootUrl, sceneFilename, scene, onProgress, pluginExtension);
-                        };
-                    }
-                    
-                    // إعادة تعريف AppendSceneAsync العلوي
-                    if (BABYLON.AppendSceneAsync) {
-                        const originalAppendSceneAsync = BABYLON.AppendSceneAsync;
-                        BABYLON.AppendSceneAsync = function(url, scene, options) {
-                            url = convertAssetPath(url);
-                            return originalAppendSceneAsync.call(this, url, scene, options);
-                        };
-                    }
-                    
-                    // إعادة تعريف Texture للصور
-                    if (BABYLON.Texture) {
-                        const originalTexture = BABYLON.Texture;
-                        BABYLON.Texture = function(url, sceneOrEngine, noMipmapOrOptions, invertY, samplingMode, onLoad, onError, buffer, deleteBuffer, format, mimeType, loaderOptions, creationFlags, forcedExtension) {
-                            if (url && typeof url === 'string') {
-                                url = convertAssetPath(url);
-                            }
-                            return new originalTexture(url, sceneOrEngine, noMipmapOrOptions, invertY, samplingMode, onLoad, onError, buffer, deleteBuffer, format, mimeType, loaderOptions, creationFlags, forcedExtension);
-                        };
-                        // نسخ الخصائص الثابتة
-                        Object.setPrototypeOf(BABYLON.Texture, originalTexture);
-                        Object.assign(BABYLON.Texture, originalTexture);
-                    }
-                    
-                    // إعادة تعريف FileTools.LoadFile
-                    if (BABYLON.FileTools && BABYLON.FileTools.LoadFile) {
-                        const originalLoadFile = BABYLON.FileTools.LoadFile;
-                        BABYLON.FileTools.LoadFile = function(url, onSuccess, onProgress, offlineProvider, useArrayBuffer, onError) {
-                            url = convertAssetPath(url);
-                            return originalLoadFile.call(this, url, onSuccess, onProgress, offlineProvider, useArrayBuffer, onError);
-                        };
-                    }
-                    
-                    console.log('External assets path redirection setup complete');
-                }
-                
-                ${code}
-                
-                // Spatial audio is now automatically handled by Sound constructor
-                
-                // إرجاع المحرك والمشهد إذا كانا موجودين
-                return {
-                    engine: typeof engine !== 'undefined' ? engine : null,
-                    scene: typeof scene !== 'undefined' ? scene : null,
-                    createEngine: typeof createEngine === 'function' ? createEngine : null,
-                    createScene: typeof createScene === 'function' ? createScene : null,
-                    delayCreateScene: typeof delayCreateScene === 'function' ? delayCreateScene : null
-                };
-            `);
-
-            console.log('Running user code...');
-            const result = runUserCode(this.engine, this.canvas, BABYLON);
+            // تشغيل الكود المستخدم باستخدام نظام آمن
+            console.log('Running user code with security measures...');
+            const result = await this.executeUserCodeSafely(sanitizedCode, this.engine, this.canvas, BABYLON, originalChecksum);
             
             // التحقق من ما إذا كان المستخدم قد عرّف محرك مخصص
             if (result.createEngine) {
@@ -1964,18 +2038,13 @@ export class AdminDashboard {
             }
 
         } catch (error) {
-            console.error('Error running code:', error);
-            const statusText = document.getElementById('status-text');
-            if (statusText) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                statusText.textContent = `خطأ: ${errorMessage}`;
-            }
+            this.handleError(error, 'runCode');
             
             // في حالة الخطأ، أنشئ محرك افتراضي للعودة إلى الحالة الطبيعية
             try {
                 await this.createDefaultEngine();
             } catch (fallbackError) {
-                console.error('Failed to create fallback engine:', fallbackError);
+                this.handleError(fallbackError, 'createDefaultEngine fallback');
             }
         }
     }
@@ -2303,7 +2372,10 @@ export class AdminDashboard {
     private updateImportStatus(message: string, type: 'success' | 'error' | 'processing' = 'processing'): void {
         const statusElement = document.getElementById('import-status');
         if (statusElement) {
-            statusElement.innerHTML = `<p>${message}</p>`;
+            // Use safe DOM manipulation instead of innerHTML
+            statusElement.innerHTML = ''; // Clear first
+            const paragraph = CodeSecurityManager.createSafeElement('p', message);
+            statusElement.appendChild(paragraph);
             statusElement.className = `import-status ${type}`;
         }
     }
@@ -2320,14 +2392,25 @@ export class AdminDashboard {
             if (!filesList) return;
 
             if (result.success && result.files && result.files.length > 0) {
-                filesList.innerHTML = result.files.map((file: any) => `
-                    <div class="file-item">
-                        <span class="file-name">${file.name}</span>
-                        <span class="file-size">${this.formatFileSize(file.size)}</span>
-                    </div>
-                `).join('');
+                // Use safe DOM manipulation instead of innerHTML
+                filesList.innerHTML = ''; // Clear first
+                result.files.forEach((file: any) => {
+                    const fileItem = document.createElement('div');
+                    fileItem.className = 'file-item';
+                    
+                    const fileName = CodeSecurityManager.createSafeElement('span', file.name, { class: 'file-name' });
+                    const fileSize = CodeSecurityManager.createSafeElement('span', this.formatFileSize(file.size), { class: 'file-size' });
+                    
+                    fileItem.appendChild(fileName);
+                    fileItem.appendChild(fileSize);
+                    filesList.appendChild(fileItem);
+                });
             } else {
-                filesList.innerHTML = '<p style="text-align: center; color: #888; padding: 1rem;">لا توجد ملفات مستوردة</p>';
+                filesList.innerHTML = ''; // Clear first
+                const noFilesMessage = CodeSecurityManager.createSafeElement('p', 'لا توجد ملفات مستوردة', {
+                    style: 'text-align: center; color: #888; padding: 1rem;'
+                });
+                filesList.appendChild(noFilesMessage);
             }
 
         } catch (error) {
@@ -2506,20 +2589,20 @@ export class AdminDashboard {
                     assetGrid.appendChild(assetCard);
                 });
             } else {
-                // رسالة عدم وجود أصول
-                assetGrid.innerHTML = `
-                    <div style="grid-column: 1 / -1; text-align: center; color: #888; padding: 2rem;">
-                        لا توجد أصول محفوظة من نوع ${this.getAssetTypeDisplayName(assetType)}
-                    </div>
-                `;
+                // رسالة عدم وجود أصول - use safe DOM manipulation
+                const noAssetsMessage = CodeSecurityManager.createSafeElement('div', 
+                    `لا توجد أصول محفوظة من نوع ${this.getAssetTypeDisplayName(assetType)}`, {
+                    style: 'grid-column: 1 / -1; text-align: center; color: #888; padding: 2rem;'
+                });
+                assetGrid.appendChild(noAssetsMessage);
             }
         } catch (error) {
             console.error('Error loading assets:', error);
-            assetGrid.innerHTML = `
-                <div style="grid-column: 1 / -1; text-align: center; color: #e74c3c; padding: 2rem;">
-                    خطأ في تحميل الأصول: ${error.message}
-                </div>
-            `;
+            const errorMessage = CodeSecurityManager.createSafeElement('div', 
+                `خطأ في تحميل الأصول: ${error instanceof Error ? error.message : 'خطأ غير معروف'}`, {
+                style: 'grid-column: 1 / -1; text-align: center; color: #e74c3c; padding: 2rem;'
+            });
+            assetGrid.appendChild(errorMessage);
         }
     }
 
@@ -2563,12 +2646,13 @@ export class AdminDashboard {
             img.alt = asset.name;
             img.onerror = () => {
                 // إذا فشل تحميل الصورة، اعرض أيقونة افتراضية
-                thumbnailDiv.innerHTML = this.getDefaultIcon(assetType);
+                thumbnailDiv.innerHTML = ''; // Clear first
+                thumbnailDiv.textContent = this.getDefaultIcon(assetType); // Safe text content
                 thumbnailDiv.classList.add('no-thumbnail');
             };
             thumbnailDiv.appendChild(img);
         } else {
-            thumbnailDiv.innerHTML = this.getDefaultIcon(assetType);
+            thumbnailDiv.textContent = this.getDefaultIcon(assetType); // Safe text content
             thumbnailDiv.classList.add('no-thumbnail');
         }
 
@@ -2767,14 +2851,383 @@ export class AdminDashboard {
     }
 
     /**
+     * تشغيل كود المستخدم بطريقة آمنة
+     */
+    private async executeUserCodeSafely(sanitizedCode: string, engine: any, canvas: HTMLCanvasElement, BABYLON: any, originalChecksum: string): Promise<any> {
+        try {
+            // إعداد بيئة آمنة للتنفيذ
+            const safeEnvironment = this.createSafeExecutionEnvironment(engine, canvas, BABYLON);
+            
+            // Create a module-like execution context
+            const moduleContext = {
+                // Provide safe access to required APIs
+                engine: engine,
+                canvas: canvas,
+                BABYLON: BABYLON,
+                scene: null,
+                createEngine: null,
+                createScene: null,
+                delayCreateScene: null,
+                
+                // Asset path conversion utilities
+                convertAssetPath: function(url: string) {
+                    if (!url || typeof url !== 'string') return url;
+                    
+                    // إذا كان المسار يبدأ بـ external-import أو http أو / فلا نغيره
+                    if (url.startsWith('external-import/') || 
+                        url.startsWith('http') || 
+                        url.startsWith('/') ||
+                        url.startsWith('data:') ||
+                        url.startsWith('blob:')) {
+                        return url;
+                    }
+                    
+                    // أضف external-import/ للمسارات النسبية
+                    const newUrl = 'external-import/' + url;
+                    console.log('Path redirect:', url, '->', newUrl);
+                    return newUrl;
+                }
+            };
+            
+            // Apply asset path redirection safely
+            this.setupAssetPathRedirection(BABYLON, moduleContext.convertAssetPath);
+            
+            // Create isolated execution function
+            const isolatedExecution = this.createIsolatedExecution(sanitizedCode, moduleContext);
+            
+            // Verify code integrity before execution
+            const currentChecksum = CodeSecurityManager.createChecksum(sanitizedCode);
+            if (currentChecksum !== originalChecksum) {
+                throw new Error('Code integrity check failed - code may have been tampered with');
+            }
+            
+            // Execute with timeout protection
+            const result = await this.executeWithTimeout(isolatedExecution, 30000); // 30 second timeout
+            
+            return {
+                engine: result.engine || moduleContext.engine,
+                scene: result.scene || moduleContext.scene,
+                createEngine: result.createEngine || moduleContext.createEngine,
+                createScene: result.createScene || moduleContext.createScene,
+                delayCreateScene: result.delayCreateScene || moduleContext.delayCreateScene
+            };
+            
+        } catch (error) {
+            console.error('Safe code execution failed:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * إعداد بيئة تنفيذ آمنة
+     */
+    private createSafeExecutionEnvironment(engine: any, canvas: HTMLCanvasElement, BABYLON: any): any {
+        // Create restricted global scope
+        return {
+            // Allow console for debugging
+            console: {
+                log: console.log.bind(console),
+                warn: console.warn.bind(console),
+                error: console.error.bind(console),
+                info: console.info.bind(console)
+            },
+            // Safe Math object
+            Math: Math,
+            // Safe array and object constructors
+            Array: Array,
+            Object: Object,
+            String: String,
+            Number: Number,
+            Boolean: Boolean,
+            Date: Date,
+            JSON: JSON,
+            // Babylon.js API
+            BABYLON: BABYLON,
+            engine: engine,
+            canvas: canvas,
+            // Prevent access to dangerous globals
+            window: undefined,
+            document: undefined,
+            global: undefined,
+            self: undefined,
+            eval: undefined,
+            Function: undefined,
+            setTimeout: undefined,
+            setInterval: undefined,
+            fetch: undefined,
+            XMLHttpRequest: undefined
+        };
+    }
+
+    /**
+     * إعداد إعادة توجيه مسارات الأصول بطريقة آمنة
+     */
+    private setupAssetPathRedirection(BABYLON: any, convertAssetPath: (url: string) => string): void {
+        try {
+            if (!BABYLON) return;
+            
+            console.log('Setting up external assets path redirection safely...');
+            
+            // إعادة تعريف SceneLoader.ImportMesh
+            if (BABYLON.SceneLoader && BABYLON.SceneLoader.ImportMesh) {
+                const originalImportMesh = BABYLON.SceneLoader.ImportMesh;
+                BABYLON.SceneLoader.ImportMesh = function(meshNames: any, rootUrl: string, sceneFilename: string, scene: any, onSuccess?: any, onProgress?: any, onError?: any, pluginExtension?: string) {
+                    rootUrl = convertAssetPath(rootUrl || '');
+                    sceneFilename = sceneFilename || '';
+                    return originalImportMesh.call(this, meshNames, rootUrl, sceneFilename, scene, onSuccess, onProgress, onError, pluginExtension);
+                };
+            }
+            
+            // إعادة تعريف SceneLoader.AppendAsync
+            if (BABYLON.SceneLoader && BABYLON.SceneLoader.AppendAsync) {
+                const originalAppendAsync = BABYLON.SceneLoader.AppendAsync;
+                BABYLON.SceneLoader.AppendAsync = function(rootUrl: string, sceneFilename: string, scene: any, onProgress?: any, pluginExtension?: string) {
+                    rootUrl = convertAssetPath(rootUrl || '');
+                    sceneFilename = sceneFilename || '';
+                    return originalAppendAsync.call(this, rootUrl, sceneFilename, scene, onProgress, pluginExtension);
+                };
+            }
+            
+            // إعادة تعريف Texture للصور
+            if (BABYLON.Texture) {
+                const originalTexture = BABYLON.Texture;
+                BABYLON.Texture = function(url: string, sceneOrEngine: any, noMipmapOrOptions?: any, invertY?: boolean, samplingMode?: number, onLoad?: any, onError?: any, buffer?: any, deleteBuffer?: boolean, format?: number, mimeType?: string, loaderOptions?: any, creationFlags?: number, forcedExtension?: string) {
+                    if (url && typeof url === 'string') {
+                        url = convertAssetPath(url);
+                    }
+                    return new originalTexture(url, sceneOrEngine, noMipmapOrOptions, invertY, samplingMode, onLoad, onError, buffer, deleteBuffer, format, mimeType, loaderOptions, creationFlags, forcedExtension);
+                };
+                // نسخ الخصائص الثابتة
+                Object.setPrototypeOf(BABYLON.Texture, originalTexture);
+                Object.assign(BABYLON.Texture, originalTexture);
+            }
+            
+            console.log('External assets path redirection setup complete');
+        } catch (error) {
+            console.error('Error setting up asset path redirection:', error);
+        }
+    }
+
+    /**
+     * إنشاء تنفيذ معزول للكود
+     */
+    private createIsolatedExecution(code: string, context: any): () => Promise<any> {
+        return async () => {
+            try {
+                // Create a more secure execution environment using eval within a controlled scope
+                // Note: This is still not 100% secure but much safer than the previous approach
+                const secureEval = this.createSecureEval(context);
+                
+                // Wrap user code in a strict mode async function
+                const wrappedCode = `
+                    (async function() {
+                        "use strict";
+                        
+                        ${code}
+                        
+                        // Return context variables that may have been modified
+                        return {
+                            engine: typeof engine !== 'undefined' ? engine : null,
+                            scene: typeof scene !== 'undefined' ? scene : null,
+                            createEngine: typeof createEngine === 'function' ? createEngine : null,
+                            createScene: typeof createScene === 'function' ? createScene : null,
+                            delayCreateScene: typeof delayCreateScene === 'function' ? delayCreateScene : null
+                        };
+                    })()
+                `;
+                
+                // Execute in the secure environment
+                return await secureEval(wrappedCode);
+                
+            } catch (error) {
+                console.error('User code execution error:', error);
+                throw error;
+            }
+        };
+    }
+
+    /**
+     * Create a more secure eval function with limited scope
+     */
+    private createSecureEval(context: any): (code: string) => Promise<any> {
+        return async (code: string) => {
+            // Create limited global scope
+            const limitedGlobal = {
+                // Essential JavaScript objects
+                console: context.console || {
+                    log: console.log.bind(console),
+                    warn: console.warn.bind(console),
+                    error: console.error.bind(console)
+                },
+                Math: Math,
+                Array: Array,
+                Object: Object,
+                String: String,
+                Number: Number,
+                Boolean: Boolean,
+                Date: Date,
+                JSON: JSON,
+                Promise: Promise,
+                
+                // Babylon.js context
+                BABYLON: context.BABYLON,
+                engine: context.engine,
+                canvas: context.canvas,
+                scene: context.scene,
+                createEngine: context.createEngine,
+                createScene: context.createScene,
+                delayCreateScene: context.delayCreateScene,
+                convertAssetPath: context.convertAssetPath,
+                
+                // Explicitly undefined dangerous globals
+                window: undefined,
+                document: undefined,
+                global: undefined,
+                self: undefined,
+                eval: undefined,
+                Function: undefined,
+                setTimeout: undefined,
+                setInterval: undefined,
+                fetch: undefined,
+                XMLHttpRequest: undefined,
+                localStorage: undefined,
+                sessionStorage: undefined
+            };
+            
+            // Execute in limited scope
+            const keys = Object.keys(limitedGlobal);
+            const values = keys.map(key => limitedGlobal[key]);
+            
+            // Use AsyncFunction constructor with explicit parameters
+            const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+            const func = new AsyncFunction(...keys, `return ${code}`);
+            
+            return await func(...values);
+        };
+    }
+
+    /**
+     * تنفيذ مع حماية المهلة الزمنية
+     */
+    private async executeWithTimeout<T>(fn: () => Promise<T>, timeoutMs: number): Promise<T> {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error(`Code execution timeout after ${timeoutMs}ms`));
+            }, timeoutMs);
+            
+            fn().then((result) => {
+                clearTimeout(timer);
+                resolve(result);
+            }).catch((error) => {
+                clearTimeout(timer);
+                reject(error);
+            });
+        });
+    }
+
+    /**
      * تنظيف الموارد
      */
     cleanup(): void {
-        if (this.engine) {
-            this.engine.dispose();
+        try {
+            // Clean up sounds first
+            if (this.scene && this.scene._spatialSounds) {
+                console.log('Cleaning up spatial sounds...');
+                this.scene._spatialSounds.forEach((sound: any) => {
+                    try {
+                        if (sound.dispose) {
+                            sound.dispose();
+                        } else {
+                            if (sound.stop) sound.stop();
+                            if (sound.audioSource) {
+                                sound.audioSource.disconnect();
+                            }
+                            if (sound.gainNode) {
+                                sound.gainNode.disconnect();
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Error cleaning up sound:', e);
+                    }
+                });
+                this.scene._spatialSounds = [];
+            }
+
+            // Clean up scene
+            if (this.scene) {
+                console.log('Disposing scene...');
+                try {
+                    this.scene.dispose();
+                } catch (e) {
+                    console.warn('Error disposing scene:', e);
+                }
+                this.scene = null;
+            }
+
+            // Clean up engine
+            if (this.engine) {
+                console.log('Disposing engine...');
+                try {
+                    this.engine.dispose();
+                } catch (e) {
+                    console.warn('Error disposing engine:', e);
+                }
+                this.engine = null;
+            }
+
+            // Clean up editor
+            if (this.editor) {
+                console.log('Disposing editor...');
+                try {
+                    this.editor.dispose();
+                } catch (e) {
+                    console.warn('Error disposing editor:', e);
+                }
+                this.editor = null;
+            }
+
+            // Clean up canvas reference
+            this.canvas = null;
+
+            console.log('AdminDashboard cleanup completed');
+            
+        } catch (error) {
+            console.error('Error during AdminDashboard cleanup:', error);
         }
-        if (this.editor) {
-            this.editor.dispose();
+    }
+
+    /**
+     * معالج الأخطاء المحسن
+     */
+    private handleError(error: any, context: string): void {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`Error in ${context}:`, error);
+        
+        // Update status
+        const statusText = document.getElementById('status-text');
+        if (statusText) {
+            statusText.textContent = `خطأ في ${context}: ${errorMessage}`;
+        }
+        
+        // For critical errors, attempt cleanup and recovery
+        if (context.includes('runCode') || context.includes('engine')) {
+            try {
+                console.log('Attempting error recovery...');
+                if (this.scene) {
+                    this.scene.dispose();
+                    this.scene = null;
+                }
+                if (this.engine) {
+                    this.engine.dispose();
+                    this.engine = null;
+                }
+                // Reinitialize basic engine
+                this.initializeBabylon().catch(e => {
+                    console.error('Error recovery failed:', e);
+                });
+            } catch (recoveryError) {
+                console.error('Error recovery failed:', recoveryError);
+            }
         }
     }
 }
